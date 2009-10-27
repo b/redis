@@ -338,7 +338,7 @@ struct sharedObjectsStruct {
     robj *crlf, *ok, *err, *emptybulk, *czero, *cone, *pong, *space,
     *colon, *nullbulk, *nullmultibulk,
     *emptymultibulk, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr,
-    *outofrangeerr, *plus,
+      *outofrangeerr, *floorreachederr, *plus,
     *select0, *select1, *select2, *select3, *select4,
     *select5, *select6, *select7, *select8, *select9;
 } shared;
@@ -397,6 +397,7 @@ static void incrCommand(redisClient *c);
 static void decrCommand(redisClient *c);
 static void incrbyCommand(redisClient *c);
 static void decrbyCommand(redisClient *c);
+static void decrwithfloorCommand(redisClient *c);
 static void selectCommand(redisClient *c);
 static void randomkeyCommand(redisClient *c);
 static void keysCommand(redisClient *c);
@@ -500,6 +501,7 @@ static struct redisCommand cmdTable[] = {
     {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
     {"incrby",incrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"decrby",decrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
+    {"decrwithfloor",decrwithfloorCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"getset",getsetCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
     {"mset",msetCommand,-3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
     {"msetnx",msetnxCommand,-3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
@@ -981,6 +983,8 @@ static void createSharedObjects(void) {
         "-ERR source and destination objects are the same\r\n"));
     shared.outofrangeerr = createObject(REDIS_STRING,sdsnew(
         "-ERR index out of range\r\n"));
+    shared.floorreachederr = createObject(REDIS_STRING, sdsnew(
+        "-ERR cannot decrement below floor\r\n"));
     shared.space = createObject(REDIS_STRING,sdsnew(" "));
     shared.colon = createObject(REDIS_STRING,sdsnew(":"));
     shared.plus = createObject(REDIS_STRING,sdsnew("+"));
@@ -2810,6 +2814,46 @@ static void mgetCommand(redisClient *c) {
             }
         }
     }
+}
+
+static void decrwithfloorCommand(redisClient *c) {
+  long long flr = strtoll(c->argv[2]->ptr, NULL, 10);
+  long long value;
+  int retval;
+  robj *o;
+
+  o = lookupKeyWrite(c->db,c->argv[1]);
+  if (o == NULL) {
+    value = 0;
+  } else {
+    if (o->type != REDIS_STRING) {
+      value = 0;
+    } else {
+      char *eptr;
+
+      value = strtoll(o->ptr, &eptr, 10);
+    }
+  }
+
+  if (value > flr) {
+    value--;
+    o = createObject(REDIS_STRING,sdscatprintf(sdsempty(),"%lld",value));
+    retval = dictAdd(c->db->dict,c->argv[1],o);
+    if (retval == DICT_ERR) {
+      dictReplace(c->db->dict,c->argv[1],o);
+      removeExpire(c->db,c->argv[1]);
+    } else {
+      incrRefCount(c->argv[1]);
+    }
+    server.dirty++;
+    addReply(c,shared.colon);
+    addReply(c,o);
+    addReply(c,shared.crlf);
+  } else {
+    /* attempt to decrement below the floor; return an out of range error */
+    addReply(c,shared.floorreachederr);
+    return;
+  }
 }
 
 static void incrDecrCommand(redisClient *c, long long incr) {
@@ -5195,6 +5239,7 @@ static struct redisFunctionSym symsTable[] = {
 {"decrCommand", (unsigned long)decrCommand},
 {"incrbyCommand", (unsigned long)incrbyCommand},
 {"decrbyCommand", (unsigned long)decrbyCommand},
+{"decrwithfloorCommand", (unsigned long)decrwithfloorCommand},
 {"selectCommand", (unsigned long)selectCommand},
 {"randomkeyCommand", (unsigned long)randomkeyCommand},
 {"keysCommand", (unsigned long)keysCommand},
